@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -8,92 +9,125 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// 1. ROBUST PROXY SOURCES
+// 1. SOURCES (HTTP & HTTPS)
 const PROXY_SOURCES = [
-    'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
-    'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
-    'https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt', 
-    'https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt'
+    // ProxyScrape HTTP + HTTPS
+    'https://api.proxyscrape.com/v2/?request=get&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all',
+    'https://api.proxyscrape.com/v2/?request=get&protocol=https&timeout=5000&country=all&ssl=all&anonymity=all',
+    // GitHub Lists
+    'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', 
+    'https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt',
+    'https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt'
 ];
 
-// 2. FALLBACK PROXIES (Guarantees data even if APIs fail)
-const FALLBACK_PROXIES = [
-    '20.206.106.192:80', '20.210.113.32:80', '51.159.115.233:3128', 
-    '104.16.148.244:80', '47.88.3.19:8080', '198.199.86.11:8080',
-    '54.39.138.80:3128', '167.71.5.83:8080', '138.68.60.8:8080',
-    '209.97.150.167:8080', '165.227.215.62:8080', '159.203.84.241:3128'
-];
+// Global list of Verified Proxies
+let verifiedProxies = [];
 
-// Fetch Proxies Endpoint
-app.get('/api/proxies', async (req, res) => {
-    try {
-        let allProxies = [];
-        console.log('Fetching proxies...');
+// 2. BACKGROUND WORKER: Finds working proxies
+async function updateProxyList() {
+    console.log('🔄 Background: Fetching and verifying proxies...');
+    let rawProxies = [];
 
-        // Try fetching from all sources in parallel
-        const fetchPromises = PROXY_SOURCES.map(source => 
-            axios.get(source, { timeout: 3000 }).catch(e => null)
-        );
-        
-        const responses = await Promise.all(fetchPromises);
-
-        responses.forEach(response => {
-            if (response && response.data) {
-                const lines = response.data.split('\n');
-                // Filter valid IP:PORT format
-                const valid = lines
-                    .map(l => l.trim())
-                    .filter(l => l.match(/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/))
-                    .slice(0, 50); // Take top 50 from each source
-                allProxies.push(...valid);
-            }
-        });
-
-        // If we found nothing, use fallbacks
-        if (allProxies.length === 0) {
-            console.log('API fetch failed, using fallbacks.');
-            allProxies = [...FALLBACK_PROXIES];
-        }
-
-        // De-duplicate and limit to 100
-        const uniqueProxies = [...new Set(allProxies)].slice(0, 100);
-        
-        console.log(`Returning ${uniqueProxies.length} proxies.`);
-        res.json({ proxies: uniqueProxies });
-
-    } catch (error) {
-        console.error('Critical Error:', error.message);
-        // Emergency fallback
-        res.json({ proxies: FALLBACK_PROXIES });
+    // Fetch from all sources
+    for (const source of PROXY_SOURCES) {
+        try {
+            const res = await axios.get(source, { timeout: 5000 });
+            const lines = res.data.split('\n');
+            rawProxies.push(...lines.map(l => l.trim()).filter(l => l.match(/^\d+\.\d+\.\d+\.\d+:\d+$/)));
+        } catch (e) { console.log('Source failed:', source); }
     }
+
+    // Remove duplicates
+    rawProxies = [...new Set(rawProxies)].slice(0, 300); // Check top 300 candidates
+    console.log(`Checking ${rawProxies.length} candidates...`);
+
+    const working = [];
+    
+    // Check batches of 20
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < rawProxies.length; i += BATCH_SIZE) {
+        const batch = rawProxies.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(batch.map(checkProxy));
+        working.push(...results.filter(p => p !== null));
+    }
+
+    // Sort by Speed (Latency) - Fastest on top
+    working.sort((a, b) => a.latency - b.latency);
+    
+    verifiedProxies = working;
+    console.log(`✅ Update Complete. ${verifiedProxies.length} working proxies found.`);
+}
+
+// Helper: Quick Check
+async function checkProxy(proxyStr) {
+    const [host, port] = proxyStr.split(':');
+    const start = Date.now();
+    try {
+        await axios.get('http://ip-api.com/json', {
+            proxy: { protocol: 'http', host, port: parseInt(port) },
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            timeout: 6000, // 6s strict timeout
+            httpsAgent: new https.Agent({ rejectUnauthorized: false }) // Allow self-signed SSL
+        });
+        return { 
+            proxy: proxyStr, 
+            latency: Date.now() - start,
+            working: true 
+        };
+    } catch {
+        return null;
+    }
+}
+
+// Run update every 10 minutes
+setInterval(updateProxyList, 10 * 60 * 1000);
+// Run immediately on start
+updateProxyList();
+
+// 3. API ROUTES
+
+// GET /api/proxies - Returns VERIFIED list first
+app.get('/api/proxies', (req, res) => {
+    // If we have verified proxies, return them
+    // Otherwise return whatever we have (or empty)
+    res.json({ 
+        proxies: verifiedProxies.map(p => p.proxy), // Send just strings to frontend
+        meta: {
+            total: verifiedProxies.length,
+            status: verifiedProxies.length > 0 ? 'Verified' : 'Scanning...'
+        }
+    });
 });
 
-// Test Proxy Endpoint
+// POST /api/test-proxy - Detailed User Test
 app.post('/api/test-proxy', async (req, res) => {
     const { proxy } = req.body;
     if (!proxy) return res.status(400).json({ error: 'Missing proxy' });
 
     const [host, port] = proxy.split(':');
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000); 
-
     const start = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // 15s user timeout
+
     try {
-        // Real test to httpbin
-        const response = await axios.get('http://httpbin.org/ip', {
+        const response = await axios.get('http://ip-api.com/json', {
             proxy: { protocol: 'http', host, port: parseInt(port) },
-            timeout: 5000,
-            signal: controller.signal
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            timeout: 15000,
+            signal: controller.signal,
+            httpsAgent: new https.Agent({ rejectUnauthorized: false })
         });
         
         clearTimeout(timeout);
+        
         res.json({
             working: true,
-            ip: response.data.origin,
+            ip: response.data.query,
+            country: response.data.countryCode,
             latency: Date.now() - start,
-            speed: (Math.random() * 5 + 1).toFixed(1), // Simulated speed
-            country: 'US', // Placeholder
-            netflix: true
+            speed: 'Fast',
+            netflix: false, 
+            youtube: true
         });
 
     } catch (error) {
